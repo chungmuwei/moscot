@@ -4,9 +4,11 @@ from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Type, Union
 from ott.geometry import epsilon_scheduler
 
 from anndata import AnnData
+import numpy as np
 
 from moscot import _constants
 from moscot._types import (
+    ArrayLike,
     CostKwargs_t,
     Numeric_t,
     OttCostFnMap_t,
@@ -16,7 +18,7 @@ from moscot._types import (
     ScaleCost_t,
 )
 from moscot.base.problems.birth_death import BirthDeathMixin, BirthDeathProblem
-from moscot.base.problems.compound_problem import B, Callback_t
+from moscot.base.problems.compound_problem import B, Callback_t, K
 from moscot.problems.space import AlignmentProblem, SpatialAlignmentMixin
 from moscot.problems.time import TemporalMixin
 
@@ -274,6 +276,130 @@ class SpatioTemporalProblem(  # type: ignore[misc]
             device=device,
             **kwargs,
         )
+
+    def interpolate_cell_state(
+        self,
+        source: K,
+        intermediate: K,
+        target: K,
+        interpolation_parameter: Optional[float] = None,
+        n_interpolated_cells: Optional[int] = None,
+        account_for_unbalancedness: bool = False,
+        batch_size: int = 256,
+        posterior_marginals: bool = True,
+        seed: Optional[int] = None,
+        backend: Literal["ott"] = "ott",
+        **kwargs: Any,
+    ) -> float:
+        """Sample `n_interpolated` cells using the :term:`OT` coupling matrix. Interpolate gene expression and 
+        cell coordinate based on the `interpolation_parameter`. Compute `Wasserstein distance <https://en.wikipedia.org/wiki/Wasserstein_metric>`_ between
+        :term:`OT`-interpolated and intermediate cells (true data).
+
+        .. seealso::
+            - TODO(MUCDK): create an example showing the usage.
+
+        This is a validation method which interpolates cells between the ``source`` and ``target`` distributions
+        leveraging the :term:`OT` coupling to approximate cells at the ``intermediate`` time point.
+
+        Parameters
+        ----------
+        source
+            Key identifying the source distribution.
+        intermediate
+            Key identifying the intermediate distribution.
+        target
+            Key identifying the target distribution.
+        interpolation_parameter
+            Interpolation parameter in :math:`(0, 1)` defining the weight of the ``source`` and ``target``
+            distributions. If :obj:`None`, it is linearly interpolated.
+        n_interpolated_cells
+            Number of cells used for interpolation. If :obj:`None`, use the number of cells in the ``intermediate``
+            distribution.
+        account_for_unbalancedness
+            Whether to account for unbalancedness by assuming exponential cell growth and death.
+        batch_size
+            Number of rows/columns of the cost matrix to materialize during :meth:`push` or :meth:`pull`.
+            Larger value will require more memory.
+        posterior_marginals
+            Whether to use :attr:`posterior_growth_rates` or :attr:`prior_growth_rates`.
+            TODO(MUCDK): needs more explanation
+        seed
+            Random seed used when sampling the interpolated cells.
+        backend
+            Backend used for the distance computation.
+        kwargs
+            Keyword arguments for the distance function, depending on the ``backend``:
+
+            - ``'ott'`` - :func:`~ott.tools.sinkhorn_divergence.sinkhorn_divergence`.
+
+        Returns
+        -------
+        The distance between :term:`OT`-interpolated cells and cells at the ``intermediate`` time point.
+        It is recommended to compare this to the distances computed by :meth:`compute_time_point_distances` and
+        :meth:`compute_random_distance`.
+        """ 
+        source_data, _, intermediate_data, _, target_data = self._get_data(  # type: ignore[misc]
+            source,
+            intermediate,
+            target,
+            posterior_marginals=posterior_marginals,
+            only_start=False,
+        )
+        interpolation_parameter = self._get_interp_param(
+            source, intermediate, target, interpolation_parameter=interpolation_parameter
+        )
+        n_interpolated_cells = n_interpolated_cells if n_interpolated_cells is not None else len(intermediate_data)
+        gex_interpolation, spt_interpolation = self._interpolate_gex_and_spatial_with_ot(
+            number_cells=n_interpolated_cells,
+            source_data=source_data,
+            target_data=target_data,
+            source=source,
+            target=target,
+            interpolation_parameter=interpolation_parameter,
+            account_for_unbalancedness=account_for_unbalancedness,
+            batch_size=batch_size,
+            seed=seed,
+        )
+        w_dist = self._compute_wasserstein_distance(intermediate_data, gex_interpolation, backend=backend, **kwargs)
+        return gex_interpolation, spt_interpolation, w_dist
+    
+    def _interpolate_gex_and_spatial_with_ot(
+        self,
+        number_cells: int,
+        source_data: ArrayLike,
+        target_data: ArrayLike,
+        source: K,
+        target: K,
+        interpolation_parameter: float,
+        account_for_unbalancedness: bool = True,
+        batch_size: int = 256,
+        seed: Optional[int] = None,
+    ) -> Tuple[ArrayLike, ArrayLike]:
+        """Adapted from TemporalMixin._interpolate_gex_with_ot"""
+        rows_sampled, cols_sampled = self._sample_from_tmap(
+            source=source,
+            target=target,
+            n_samples=number_cells,
+            source_dim=len(source_data),
+            target_dim=len(target_data),
+            batch_size=batch_size,
+            account_for_unbalancedness=account_for_unbalancedness,
+            interpolation_parameter=interpolation_parameter,
+            seed=seed,
+        )
+        interpolated_gex = (
+            source_data[np.repeat(rows_sampled, [len(col) for col in cols_sampled]), :] * (1 - interpolation_parameter)
+            + target_data[np.hstack(cols_sampled), :] * interpolation_parameter
+        )
+        # Get the source and target spatial
+        source_spatial=self.problems[(source, target)].adata_src.obsm[self.spatial_key]
+        target_spatial=self.problems[(source, target)].adata_tgt.obsm[self.spatial_key]
+        interpolated_spatial = (
+            source_spatial[np.repeat(rows_sampled, [len(col) for col in cols_sampled]), :] * (1 - interpolation_parameter)
+            + target_spatial[np.hstack(cols_sampled), :] * interpolation_parameter
+        )
+
+        return interpolated_gex, interpolated_spatial 
 
     @property
     def _valid_policies(self) -> Tuple[Policy_t, ...]:
